@@ -1,0 +1,1 @@
+/usr/bin/g++ -Wl,--dependency-file=CMakeFiles/HallOfFame.dir/link.d CMakeFiles/HallOfFame.dir/main.cpp.o -o HallOfFame  _deps/ftxui-build/libftxui-component.a _deps/ftxui-build/libftxui-dom.a _deps/ftxui-build/libftxui-screen.a

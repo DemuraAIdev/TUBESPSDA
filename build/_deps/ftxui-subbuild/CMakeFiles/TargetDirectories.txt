@@ -1,0 +1,3 @@
+/home/abduvaiz/TUBESPSDA/build/_deps/ftxui-subbuild/CMakeFiles/ftxui-populate.dir
+/home/abduvaiz/TUBESPSDA/build/_deps/ftxui-subbuild/CMakeFiles/edit_cache.dir
+/home/abduvaiz/TUBESPSDA/build/_deps/ftxui-subbuild/CMakeFiles/rebuild_cache.dir
