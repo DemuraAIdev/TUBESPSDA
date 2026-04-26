@@ -6,5 +6,5 @@ CXX_DEFINES =
 
 CXX_INCLUDES = -I/home/abduvaiz/TUBESPSDA/build/_deps/ftxui-src/src -isystem /home/abduvaiz/TUBESPSDA/build/_deps/ftxui-src/include
 
-CXX_FLAGS = -std=gnu++17 -fPIC
+CXX_FLAGS = -g -std=gnu++17 -fPIC
 
