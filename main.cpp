@@ -11,8 +11,9 @@
 #include <fstream>
 #include <algorithm>
 #include <cctype>
+#include <random>
+#include <ctime>
 
-//  SHA-256 
 namespace sha256_impl {
 
 static const std::array<uint32_t, 64> K = {{
@@ -43,13 +44,10 @@ static inline uint32_t sig0(uint32_t x){ return rotr(x,7)  ^ rotr(x,18) ^ (x >> 
 static inline uint32_t sig1(uint32_t x){ return rotr(x,17) ^ rotr(x,19) ^ (x >> 10); }
 
 std::string compute(const std::string& input) {
-    // Initial hash values (first 32 bits of fractional parts of sqrt of first 8 primes)
     uint32_t h[8] = {
         0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
         0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19
     };
-
-    // Pre-processing: padding
     std::vector<uint8_t> msg(input.begin(), input.end());
     uint64_t bit_len = msg.size() * 8ULL;
     msg.push_back(0x80);
@@ -57,7 +55,6 @@ std::string compute(const std::string& input) {
     for (int i = 7; i >= 0; --i)
         msg.push_back(static_cast<uint8_t>((bit_len >> (i * 8)) & 0xFF));
 
-    // Process each 512-bit chunk
     for (size_t chunk = 0; chunk < msg.size(); chunk += 64) {
         uint32_t w[64];
         for (int i = 0; i < 16; ++i)
@@ -88,18 +85,29 @@ std::string compute(const std::string& input) {
 }
 
 } // namespace sha256_impl
-const std::string SALT = "TUBESPSDA_SECURE_SALT_2024";
 
-std::string hash_sha256(const std::string& input) {
-    // HMAC-like: SHA256(salt + SHA256(input + salt))
-    // Lebih kuat dari double-std::hash sebelumnya
-    std::string inner = sha256_impl::compute(input + SALT);
-    return sha256_impl::compute(SALT + inner);
+// Generates a 32-byte (64 hex char) random salt using CSPRNG
+std::string generate_salt() {
+    std::random_device rd;
+    std::mt19937_64 rng(rd());
+    std::uniform_int_distribution<uint64_t> dist;
+    std::ostringstream oss;
+    for (int i = 0; i < 4; ++i)
+        oss << std::hex << std::setw(16) << std::setfill('0') << dist(rng);
+    return oss.str();
 }
 
-// ============================================================
-//  Utility — trim & secure_compare (dipakai di config & auth)
-// ============================================================
+// HMAC-like: SHA256(salt + SHA256(input + salt))
+std::string hash_sha256(const std::string& input, const std::string& salt) {
+    std::string inner = sha256_impl::compute(input + salt);
+    return sha256_impl::compute(salt + inner);
+}
+
+// Computes MAC for file integrity: SHA256(salt + SHA256(data + salt))
+std::string compute_mac(const std::string& data, const std::string& salt) {
+    return hash_sha256(data, salt);
+}
+
 std::string trim(const std::string& s) {
     size_t start = s.find_first_not_of(" \t\r\n");
     size_t end   = s.find_last_not_of(" \t\r\n");
@@ -114,52 +122,132 @@ bool secure_compare(const std::string& a, const std::string& b) {
     return diff == 0;
 }
 
+// Config file format (6 lines):
+//   Line 1: username
+//   Line 2: salt (64-char hex)
+//   Line 3: pass_hash (64-char hex)
+//   Line 4: failed_attempts (int)
+//   Line 5: lockout_until (Unix epoch seconds)
+//   Line 6: MAC = compute_mac(lines 1–5, salt)
 const std::string CONFIG_FILE = "config.dat";
-const std::string ADMIN_USER  = "admin";   // username tetap "admin"
 
 struct Config {
-    bool        exists      = false;
+    bool        exists         = false;
+    std::string username;
+    std::string salt;
     std::string pass_hash;
+    int         failed_attempts = 0;
+    long long   lockout_until   = 0;
 };
+
+static std::string config_canonical(const Config& cfg) {
+    return cfg.username      + "\n" +
+           cfg.salt          + "\n" +
+           cfg.pass_hash     + "\n" +
+           std::to_string(cfg.failed_attempts) + "\n" +
+           std::to_string(cfg.lockout_until)   + "\n";
+}
 
 Config load_config() {
     Config cfg;
     std::ifstream f(CONFIG_FILE);
-    if (!f) return cfg;          // file belum ada → first run
-    std::string line1, line2;
-    if (!std::getline(f, line1)) return cfg;
-    if (!std::getline(f, line2)) return cfg;
-    // baris 1 harus "admin", baris 2 hash 64-char hex
-    if (trim(line1) != ADMIN_USER) return cfg;
-    if (trim(line2).size() != 64)  return cfg;
-    cfg.exists    = true;
-    cfg.pass_hash = trim(line2);
+    if (!f) return cfg;
+
+    std::string line[6];
+    for (int i = 0; i < 6; ++i)
+        if (!std::getline(f, line[i])) return cfg;
+
+    cfg.username  = trim(line[0]);
+    cfg.salt      = trim(line[1]);
+    cfg.pass_hash = trim(line[2]);
+
+    if (cfg.username.empty())        return cfg;
+    if (cfg.salt.size()      != 64)  return cfg;
+    if (cfg.pass_hash.size() != 64)  return cfg;
+
+    try {
+        cfg.failed_attempts = std::stoi(trim(line[3]));
+        cfg.lockout_until   = std::stoll(trim(line[4]));
+    } catch (...) { return cfg; }
+
+    // Verify MAC — reject config if file has been tampered with
+    std::string stored_mac   = trim(line[5]);
+    std::string expected_mac = compute_mac(config_canonical(cfg), cfg.salt);
+    if (!secure_compare(stored_mac, expected_mac))
+        return cfg;
+
+    cfg.exists = true;
     return cfg;
 }
 
-bool save_config(const std::string& pass_plain) {
+bool save_config(Config& cfg) {
+    std::string mac = compute_mac(config_canonical(cfg), cfg.salt);
     std::ofstream f(CONFIG_FILE);
     if (!f) return false;
-    f << ADMIN_USER << '\n' << hash_sha256(pass_plain) << '\n';
+    f << cfg.username          << '\n'
+      << cfg.salt              << '\n'
+      << cfg.pass_hash         << '\n'
+      << cfg.failed_attempts   << '\n'
+      << cfg.lockout_until     << '\n'
+      << mac                   << '\n';
     return true;
 }
 
-bool authenticate(const std::string& user, const std::string& pass,
-                  const std::string& stored_hash) {
-    return secure_compare(trim(user), ADMIN_USER) &&
-           secure_compare(hash_sha256(pass), stored_hash);
+bool authenticate(const std::string& user, const std::string& pass, const Config& cfg) {
+    return secure_compare(trim(user), cfg.username) &&
+           secure_compare(hash_sha256(pass, cfg.salt), cfg.pass_hash);
 }
 
-#include <ftxui/component/component.hpp>
-#include <ftxui/component/component_base.hpp>
-#include <ftxui/component/component_options.hpp>
-#include <ftxui/component/screen_interactive.hpp>
-#include <ftxui/dom/elements.hpp>
-#include <ftxui/dom/table.hpp>
+const std::string DATA_FILE    = "leaderboard.csv";
+const std::string DATA_MAC_FILE = "leaderboard.mac";
 
-using namespace ftxui;
+// Quotes a CSV field if it contains commas, quotes, or newlines
+static std::string csv_quote(const std::string& s) {
+    bool needs = (s.find(',') != std::string::npos  ||
+                  s.find('"') != std::string::npos  ||
+                  s.find('\n')!= std::string::npos  ||
+                  s.find('\r')!= std::string::npos);
+    if (!needs) return s;
+    std::string out = "\"";
+    for (char c : s) {
+        if (c == '"') out += "\"\"";
+        else          out += c;
+    }
+    out += '"';
+    return out;
+}
 
-enum class AppState { SETUP, LOGIN, LOCKED, MENU, ADD_PLAYER, VIEW_BOARD, EDIT_PLAYER, CREDITS };
+// Parses one CSV field (quoted or unquoted), advances pos past the trailing comma/EOL
+static bool csv_parse_field(const std::string& line, size_t& pos,
+                             std::string& out) {
+    out.clear();
+    if (pos >= line.size()) return false;
+    if (line[pos] == '"') {
+        ++pos;
+        while (pos < line.size()) {
+            if (line[pos] == '"') {
+                if (pos + 1 < line.size() && line[pos+1] == '"') {
+                    out += '"'; pos += 2;
+                } else {
+                    ++pos; break;
+                }
+            } else {
+                out += line[pos++];
+            }
+        }
+        if (pos < line.size() && line[pos] == ',') ++pos;
+    } else {
+        size_t comma = line.find(',', pos);
+        if (comma == std::string::npos) {
+            out = line.substr(pos);
+            pos = line.size();
+        } else {
+            out = line.substr(pos, comma - pos);
+            pos = comma + 1;
+        }
+    }
+    return true;
+}
 
 struct Player {
     std::string name;
@@ -171,72 +259,82 @@ void insertion_sort(std::vector<Player>& players) {
         Player key = players[i];
         int j = static_cast<int>(i) - 1;
         while (j >= 0 && players[j].score < key.score) {
-            players[j + 1] = players[j];
-            --j;
+            players[j + 1] = players[j]; --j;
         }
         players[j + 1] = key;
     }
 }
 
-const std::string DATA_FILE = "leaderboard.csv";
+static std::string csv_content(const std::vector<Player>& players) {
+    std::ostringstream oss;
+    for (const auto& p : players)
+        oss << csv_quote(p.name) << ',' << p.score << '\n';
+    return oss.str();
+}
 
-void save_players(const std::vector<Player>& players) {
-    std::ofstream f(DATA_FILE);
-    if (!f) return;
-    for (const auto& p : players) {
-        bool has_comma = p.name.find(',') != std::string::npos;
-        if (has_comma) {
-            std::string escaped;
-            for (char c : p.name) {
-                if (c == '"') escaped += "\"\"";
-                else escaped += c;
-            }
-            f << '"' << escaped << '"' << ',' << p.score << '\n';
-        } else {
-            f << p.name << ',' << p.score << '\n';
-        }
+void save_players(const std::vector<Player>& players, const std::string& salt) {
+    std::string content = csv_content(players);
+    {
+        std::ofstream f(DATA_FILE);
+        if (!f) return;
+        f << content;
+    }
+    {
+        std::ofstream fm(DATA_MAC_FILE);
+        if (!fm) return;
+        fm << compute_mac(content, salt) << '\n';
     }
 }
 
-std::vector<Player> load_players() {
+std::vector<Player> load_players(const std::string& salt) {
     std::vector<Player> result;
+
     std::ifstream f(DATA_FILE);
     if (!f) return result;
-    std::string line;
-    while (std::getline(f, line)) {
-        if (line.empty()) continue;
-        std::string name, score_str;
-        if (!line.empty() && line[0] == '"') {
-            size_t pos = 1;
-            while (pos < line.size() && line[pos] != '"') {
-                if (line[pos] == '"' && pos+1 < line.size() && line[pos+1] == '"') {
-                    name += '"'; pos += 2;
-                } else {
-                    name += line[pos++];
-                }
-            }
-            size_t comma = line.find(',', pos);
-            if (comma == std::string::npos) continue;
-            score_str = line.substr(comma + 1);
-        } else {
-            size_t comma = line.rfind(',');
-            if (comma == std::string::npos) continue;
-            name      = line.substr(0, comma);
-            score_str = line.substr(comma + 1);
+    std::ostringstream buf;
+    buf << f.rdbuf();
+    std::string content = buf.str();
+
+    {
+        std::ifstream fm(DATA_MAC_FILE);
+        if (fm) {
+            std::string stored_mac;
+            std::getline(fm, stored_mac);
+            stored_mac = trim(stored_mac);
+            std::string expected_mac = compute_mac(content, salt);
+            if (!secure_compare(stored_mac, expected_mac))
+                return result; // CSV has been tampered with
         }
-        name      = trim(name);
-        score_str = trim(score_str);
-        if (name.empty() || score_str.empty()) continue;
+        // If MAC file is absent (legacy data), load without verification
+    }
+
+    std::istringstream ss(content);
+    std::string line;
+    while (std::getline(ss, line)) {
+        if (line.empty()) continue;
+        size_t pos = 0;
+        std::string name_field, score_field;
+        if (!csv_parse_field(line, pos, name_field)) continue;
+        if (!csv_parse_field(line, pos, score_field)) continue;
+
+        name_field  = trim(name_field);
+        score_field = trim(score_field);
+        if (name_field.empty() || score_field.empty()) continue;
+
         bool valid = true;
-        for (char c : score_str)
+        for (char c : score_field)
             if (!std::isdigit(static_cast<unsigned char>(c))) { valid = false; break; }
         if (!valid) continue;
-        try { result.push_back({ name, std::stoll(score_str) }); } catch (...) {}
+
+        long long score_val = 0;
+        try { score_val = std::stoll(score_field); } catch (...) { continue; }
+        if (score_val <= 0) continue;
+
+        result.push_back({ name_field, score_val });
     }
     return result;
 }
 
-// Cek duplikat nama (case-insensitive)
 bool name_exists(const std::vector<Player>& players, const std::string& name) {
     std::string ln = name;
     std::transform(ln.begin(), ln.end(), ln.begin(),
@@ -250,110 +348,157 @@ bool name_exists(const std::vector<Player>& players, const std::string& name) {
     return false;
 }
 
+#include <ftxui/component/component.hpp>
+#include <ftxui/component/component_base.hpp>
+#include <ftxui/component/component_options.hpp>
+#include <ftxui/component/screen_interactive.hpp>
+#include <ftxui/dom/elements.hpp>
+#include <ftxui/dom/table.hpp>
+
+using namespace ftxui;
+
+enum class AppState { SETUP, LOGIN, LOCKED, MENU, ADD_PLAYER, VIEW_BOARD, EDIT_PLAYER, CREDITS };
+
 int main() {
     const int MAX_ATTEMPTS = 5;
     const int LOCKOUT_SECS = 30;
 
-    // Load config — tentukan apakah perlu SETUP atau langsung LOGIN
     Config cfg = load_config();
     AppState state = cfg.exists ? AppState::LOGIN : AppState::SETUP;
     std::string error_msg;
     std::string input_error;
 
     std::string username, password;
-    int attempts = MAX_ATTEMPTS;
-    std::chrono::steady_clock::time_point lockout_until;
 
-    // Load data dari file saat startup
-    std::vector<Player> players = load_players();
+    int       attempts      = MAX_ATTEMPTS - (cfg.exists ? cfg.failed_attempts : 0);
+    long long lockout_epoch = cfg.exists ? cfg.lockout_until : 0;
+    if (attempts < 0) attempts = 0;
+    if (lockout_epoch > 0) {
+        auto now_epoch = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        if (now_epoch < lockout_epoch) state = AppState::LOCKED;
+        else {
+            cfg.failed_attempts = 0;
+            cfg.lockout_until   = 0;
+            attempts = MAX_ATTEMPTS;
+            save_config(cfg);
+        }
+    }
+
+    std::vector<Player> players = cfg.exists
+        ? load_players(cfg.salt)
+        : std::vector<Player>{};
     bool sorted = false;
     std::string new_name, new_score_str;
 
-    // State untuk edit/hapus
     int    selected_idx   = -1;
     std::string edit_name, edit_score_str;
     bool   confirm_delete = false;
     bool   confirm_reset  = false;
 
-    // Setup wizard state
-    std::string setup_pass1, setup_pass2;
+    std::string setup_user, setup_pass1, setup_pass2;
     std::string setup_error;
 
     auto screen = ScreenInteractive::Fullscreen();
 
-    // STYLES
     auto btn_opt = ButtonOption::Animated();
     btn_opt.transform = [](const EntryState& s) {
         auto element = text(s.label);
-        if (s.focused) {
-            element |= inverted;
-            element |= bold;
-        }
+        if (s.focused) { element |= inverted; element |= bold; }
         return element | center | border;
     };
 
-    // LOGIN inputs
     Component input_username = Input(&username, "username");
-    InputOption pass_opt;
-    pass_opt.password = true;
+    InputOption pass_opt; pass_opt.password = true;
     Component input_password = Input(&password, "password", pass_opt);
 
-    // SETUP wizard inputs
-    InputOption setup_opt;
-    setup_opt.password = true;
-    Component input_setup_pass1 = Input(&setup_pass1, "password baru", setup_opt);
-    Component input_setup_pass2 = Input(&setup_pass2, "konfirmasi password", setup_opt);
+    InputOption setup_opt; setup_opt.password = true;
+    Component input_setup_user  = Input(&setup_user,  "new username");
+    Component input_setup_pass1 = Input(&setup_pass1, "new password",      setup_opt);
+    Component input_setup_pass2 = Input(&setup_pass2, "confirm password",  setup_opt);
 
     auto on_setup = [&] {
         setup_error.clear();
-        if (setup_pass1.empty()) { setup_error = "Password tidak boleh kosong."; return; }
-        if (setup_pass1.size() < 6) { setup_error = "Password minimal 6 karakter."; return; }
-        if (setup_pass1 != setup_pass2) { setup_error = "Konfirmasi password tidak cocok."; return; }
-        if (!save_config(setup_pass1)) { setup_error = "Gagal menyimpan config.dat!"; return; }
-        cfg = load_config();   // reload supaya pass_hash terisi
+        std::string u = trim(setup_user);
+        if (u.empty())            { setup_error = "Username cannot be blank.";           return; }
+        if (u.size() < 3)         { setup_error = "Username must be at least 3 chars.";  return; }
+        if (setup_pass1.empty())  { setup_error = "Password cannot be blank.";           return; }
+        if (setup_pass1.size()<6) { setup_error = "Password must be at least 6 chars.";  return; }
+        if (setup_pass1 != setup_pass2) { setup_error = "Passwords do not match.";       return; }
+
+        cfg.salt            = generate_salt();
+        cfg.username        = u;
+        cfg.pass_hash       = hash_sha256(setup_pass1, cfg.salt);
+        cfg.failed_attempts = 0;
+        cfg.lockout_until   = 0;
+
+        if (!save_config(cfg)) { setup_error = "Failed to write config.dat!"; return; }
+
+        cfg.exists = true;
+        attempts   = MAX_ATTEMPTS;
+        setup_user.clear();
         setup_pass1.clear();
         setup_pass2.clear();
-        state = AppState::LOGIN;
-        error_msg = "Setup selesai! Silakan login.";
+        state     = AppState::LOGIN;
+        error_msg = "Setup complete! Please log in.";
     };
 
-    Component btn_setup_confirm = Button("  Simpan & Lanjut  ", on_setup, btn_opt);
+    Component btn_setup_confirm = Button("  Save & Continue  ", on_setup, btn_opt);
     Component setup_container = Container::Vertical({
+        input_setup_user,
         input_setup_pass1,
         input_setup_pass2,
         btn_setup_confirm,
     });
 
+    auto persist_lockout = [&](bool locked) {
+        if (!cfg.exists) return;
+        if (locked) {
+            cfg.lockout_until = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count() + LOCKOUT_SECS;
+        }
+        save_config(cfg);
+    };
+
     auto on_login = [&] {
         error_msg.clear();
         if (state == AppState::LOCKED) {
-            auto now = std::chrono::steady_clock::now();
-            if (now < lockout_until) {
-                auto secs = std::chrono::duration_cast<std::chrono::seconds>(
-                    lockout_until - now).count();
-                error_msg = "Locked. Try again in " + std::to_string(secs) + "s.";
+            auto now_epoch = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            if (now_epoch < cfg.lockout_until) {
+                long long secs = cfg.lockout_until - now_epoch;
+                error_msg = "Account locked. Try again in " + std::to_string(secs) + "s.";
                 return;
             }
-            state    = AppState::LOGIN;
-            attempts = MAX_ATTEMPTS;
+            cfg.failed_attempts = 0;
+            cfg.lockout_until   = 0;
+            attempts            = MAX_ATTEMPTS;
+            save_config(cfg);
+            state = AppState::LOGIN;
         }
         if (trim(username).empty()) { error_msg = "Username cannot be blank."; return; }
         if (password.empty())        { error_msg = "Password cannot be blank.";  return; }
-        if (authenticate(username, password, cfg.pass_hash)) {
-            state = AppState::MENU;
+
+        if (authenticate(username, password, cfg)) {
+            cfg.failed_attempts = 0;
+            cfg.lockout_until   = 0;
+            save_config(cfg);
+            attempts = MAX_ATTEMPTS;
+            players  = load_players(cfg.salt);
+            state    = AppState::MENU;
         } else {
-            --attempts;
             password.clear();
-            if (attempts <= 0) {
+            cfg.failed_attempts++;
+            if (cfg.failed_attempts >= MAX_ATTEMPTS) {
+                persist_lockout(true);
                 state = AppState::LOCKED;
-                lockout_until = std::chrono::steady_clock::now() +
-                                std::chrono::seconds(LOCKOUT_SECS);
-                error_msg = "Too many failures. Locked for " +
+                error_msg = "Too many failed attempts. Account locked for " +
                             std::to_string(LOCKOUT_SECS) + " seconds.";
             } else {
-                error_msg = "Invalid credentials. " +
-                            std::to_string(attempts) + " attempt(s) remaining.";
+                persist_lockout(false);
+                error_msg = "Invalid credentials.";
             }
+            attempts = MAX_ATTEMPTS - cfg.failed_attempts;
         }
     };
 
@@ -364,62 +509,41 @@ int main() {
         login_button,
     });
 
-    // MENU buttons
     Component btn_add_player = Button(" Add Player ", [&] {
-        input_error.clear();
-        new_name.clear();
-        new_score_str.clear();
+        input_error.clear(); new_name.clear(); new_score_str.clear();
         state = AppState::ADD_PLAYER;
     }, btn_opt);
     Component btn_view = Button(" Leaderboard ", [&] {
-        selected_idx   = -1;
-        confirm_delete = false;
-        confirm_reset  = false;
+        selected_idx = -1; confirm_delete = false; confirm_reset = false;
         state = AppState::VIEW_BOARD;
     }, btn_opt);
     Component btn_sort = Button(" Sort Scores ", [&] {
         if (players.empty()) { error_msg = "No players to sort."; return; }
-        insertion_sort(players);
-        sorted = true;
-        save_players(players);  // Simpan urutan baru
+        insertion_sort(players); sorted = true;
+        save_players(players, cfg.salt);
         error_msg.clear();
     }, btn_opt);
-    Component btn_credits = Button(" Credits ", [&] {
-        state = AppState::CREDITS;
-    }, btn_opt);
+    Component btn_credits = Button(" Credits ", [&] { state = AppState::CREDITS; }, btn_opt);
 
     auto btn_danger_opt = btn_opt;
     btn_danger_opt.transform = [](const EntryState& s) {
         auto element = text(s.label);
-        if (s.focused) {
-            element |= inverted;
-            element |= bold;
-        }
+        if (s.focused) { element |= inverted; element |= bold; }
         return element | center | border | color(Color::RedLight);
     };
 
     Component btn_logout = Button("  Logout  ", [&] {
-        state    = AppState::LOGIN;
-        username.clear();
-        password.clear();
-        error_msg.clear();
-        input_error.clear();
+        state = AppState::LOGIN;
+        username.clear(); password.clear();
+        error_msg.clear(); input_error.clear();
         attempts = MAX_ATTEMPTS;
-        // Data player TIDAK dihapus saat logout — tersimpan di file
     }, btn_danger_opt);
 
     Component menu_actions = Container::Horizontal({
-        btn_add_player,
-        btn_view,
-        btn_sort,
-        btn_credits,
+        btn_add_player, btn_view, btn_sort, btn_credits,
     });
-    Component menu_container = Container::Vertical({
-        menu_actions,
-        btn_logout,
-    });
+    Component menu_container = Container::Vertical({ menu_actions, btn_logout });
 
-    // ADD PLAYER inputs
     Component input_name  = Input(&new_name,      "Player name");
     Component input_score = Input(&new_score_str, "Score (number)");
 
@@ -427,50 +551,39 @@ int main() {
         input_error.clear();
         std::string n = trim(new_name);
         std::string s = trim(new_score_str);
-        if (n.empty()) { input_error = "Name cannot be blank.";        return; }
-        if (s.empty()) { input_error = "Score cannot be blank.";       return; }
-        for (char c : s) {
+        if (n.empty()) { input_error = "Name cannot be blank.";  return; }
+        if (s.empty()) { input_error = "Score cannot be blank."; return; }
+        if (n.find('\n') != std::string::npos || n.find('\r') != std::string::npos) {
+            input_error = "Name contains invalid characters."; return;
+        }
+        for (char c : s)
             if (!std::isdigit(static_cast<unsigned char>(c))) {
-                input_error = "Score must be a whole number.";
-                return;
+                input_error = "Score must be a whole number."; return;
             }
-        }
-        if (s.size() > 18) {
-            input_error = "Score too long (max 18 digit).";
-            return;
-        }
+        if (s.size() > 18) { input_error = "Score too long (max 18 digits)."; return; }
         long long score_val = std::stoll(s);
-        if (score_val <= 0) {
-            input_error = "Score must be greater than 0.";
-            return;
-        }
+        if (score_val <= 0) { input_error = "Score must be greater than 0."; return; }
         if (name_exists(players, n)) {
-            input_error = "Player \"" + n + "\" already exists!";
-            return;
+            input_error = "Player \"" + n + "\" already exists!"; return;
         }
         players.push_back({ n, score_val });
         sorted = false;
-        save_players(players);   // Simpan ke file setiap kali ada penambahan
-        new_name.clear();
-        new_score_str.clear();
+        save_players(players, cfg.salt);
+        new_name.clear(); new_score_str.clear();
         input_error = "Player added & saved!";
     };
 
     Component btn_confirm_add = Button("  Add  ",  on_add_player, btn_opt);
     Component btn_back_add    = Button("  Back  ", [&] {
-        input_error.clear();
-        state = AppState::MENU;
+        input_error.clear(); state = AppState::MENU;
     }, btn_opt);
-
     Component add_container = Container::Vertical({
-        input_name,
-        input_score,
+        input_name, input_score,
         Container::Horizontal({ btn_confirm_add, btn_back_add }),
     });
 
-    // EDIT PLAYER inputs
-    Component input_edit_name  = Input(&edit_name,       "Player name");
-    Component input_edit_score = Input(&edit_score_str,  "Score (number)");
+    Component input_edit_name  = Input(&edit_name,      "Player name");
+    Component input_edit_score = Input(&edit_score_str, "Score (number)");
 
     auto on_edit_player = [&] {
         input_error.clear();
@@ -479,15 +592,17 @@ int main() {
         std::string s = trim(edit_score_str);
         if (n.empty()) { input_error = "Name cannot be blank.";  return; }
         if (s.empty()) { input_error = "Score cannot be blank."; return; }
+        if (n.find('\n') != std::string::npos || n.find('\r') != std::string::npos) {
+            input_error = "Name contains invalid characters."; return;
+        }
         for (char c : s)
             if (!std::isdigit(static_cast<unsigned char>(c))) {
                 input_error = "Score must be a whole number."; return;
             }
-        if (s.size() > 18) { input_error = "Score too long (max 18 digit)."; return; }
+        if (s.size() > 18) { input_error = "Score too long (max 18 digits)."; return; }
         long long score_val = std::stoll(s);
         if (score_val <= 0) { input_error = "Score must be greater than 0."; return; }
 
-        // Cek duplikat nama — kecuali nama player itu sendiri
         std::string ln = n;
         std::transform(ln.begin(), ln.end(), ln.begin(),
             [](unsigned char c){ return std::tolower(c); });
@@ -502,75 +617,53 @@ int main() {
         players[selected_idx].name  = n;
         players[selected_idx].score = score_val;
         sorted = false;
-        save_players(players);
+        save_players(players, cfg.salt);
         input_error = "Player updated!";
     };
 
     Component btn_confirm_edit = Button("  Save  ", on_edit_player, btn_opt);
     Component btn_back_edit    = Button("  Back  ", [&] {
-        input_error.clear();
-        confirm_delete = false;
-        state = AppState::VIEW_BOARD;
+        input_error.clear(); confirm_delete = false; state = AppState::VIEW_BOARD;
     }, btn_opt);
-
     Component edit_container = Container::Vertical({
-        input_edit_name,
-        input_edit_score,
+        input_edit_name, input_edit_score,
         Container::Horizontal({ btn_confirm_edit, btn_back_edit }),
     });
 
-    // VIEW BOARD back button
-    Component btn_back_view = Button("  Back  ", [&] {
-        state = AppState::MENU;
-    }, btn_opt);
+    Component btn_back_view = Button("  Back  ", [&] { state = AppState::MENU; }, btn_opt);
     Component view_container = Container::Vertical({ btn_back_view });
 
-    // CREDITS back button
-    Component btn_back_credits = Button("  Back  ", [&] {
-        state = AppState::MENU;
-    }, btn_opt);
+    Component btn_back_credits = Button("  Back  ", [&] { state = AppState::MENU; }, btn_opt);
     Component credits_container = Container::Vertical({ btn_back_credits });
+    Component locked_container  = Container::Vertical({});
 
-    // LOCKED placeholder
-    Component locked_container = Container::Vertical({});
-
-    // Root switchable container
     int tab_index = 0;
     Component root = Container::Tab({
-        setup_container,   // 0 = SETUP
-        login_container,   // 1 = LOGIN
-        locked_container,  // 2 = LOCKED
-        menu_container,    // 3 = MENU
-        add_container,     // 4 = ADD_PLAYER
-        view_container,    // 5 = VIEW_BOARD
-        edit_container,    // 6 = EDIT_PLAYER
-        credits_container, // 7 = CREDITS
+        setup_container,   // 0
+        login_container,   // 1
+        locked_container,  // 2
+        menu_container,    // 3
+        add_container,     // 4
+        view_container,    // 5
+        edit_container,    // 6
+        credits_container, // 7
     }, &tab_index);
 
-    // Renderer
     auto renderer = Renderer(root, [&]() -> Element {
         tab_index = static_cast<int>(state);
 
-        // SETUP (first run)
         if (state == AppState::SETUP) {
             Elements rows;
-            rows.push_back(
-                text("Selamat datang di Hall of Fame!") | bold | center | color(Color::Cyan)
-            );
+            rows.push_back(text("Welcome to Hall of Fame!") | bold | center | color(Color::Cyan));
             rows.push_back(separatorEmpty());
-            rows.push_back(
-                text("Ini adalah pertama kali program dijalankan.") | dim | center
-            );
-            rows.push_back(
-                text("Buat password admin untuk melanjutkan.") | dim | center
-            );
+            rows.push_back(text("First run detected.") | dim | center);
+            rows.push_back(text("Create an admin account to continue.") | dim | center);
             rows.push_back(separator());
-            rows.push_back(hbox(text(" Username      : "),
-                text("admin") | bold | color(Color::GreenLight)));
+            rows.push_back(hbox(text(" New Username : "), input_setup_user->Render()));
             rows.push_back(separatorEmpty());
-            rows.push_back(hbox(text(" Password Baru : "), input_setup_pass1->Render()));
+            rows.push_back(hbox(text(" New Password : "), input_setup_pass1->Render()));
             rows.push_back(separatorEmpty());
-            rows.push_back(hbox(text(" Konfirmasi    : "), input_setup_pass2->Render()));
+            rows.push_back(hbox(text(" Confirm      : "), input_setup_pass2->Render()));
             rows.push_back(separator());
             if (!setup_error.empty()) {
                 rows.push_back(text(" " + setup_error) | color(Color::Red) | center);
@@ -578,24 +671,26 @@ int main() {
             }
             rows.push_back(btn_setup_confirm->Render() | center);
             rows.push_back(separatorEmpty());
-            rows.push_back(
-                text("Password disimpan sebagai hash SHA-256 di config.dat")
-                    | dim | center
-            );
+            rows.push_back(text("Password stored as HMAC-SHA256 + random salt in config.dat") | dim | center);
             return center(
-                window(text(" Setup Awal — Hall of Fame ") | bold | center,
+                window(text(" Initial Setup — Hall of Fame ") | bold | center,
                     vbox(std::move(rows))
-                ) | clear_under | size(WIDTH, GREATER_THAN, 55)
+                ) | clear_under | size(WIDTH, GREATER_THAN, 60)
             );
         }
 
-        // LOCKED
         if (state == AppState::LOCKED) {
+            auto now_epoch = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            long long secs_left = (cfg.lockout_until > now_epoch)
+                                ? (cfg.lockout_until - now_epoch) : 0;
             return center(
                 window(text(" Access Denied ") | bold,
                     vbox({
                         text("Account locked.") | center | color(Color::Red),
-                        text(error_msg.empty() ? "Too many failed attempts." : error_msg)
+                        text(secs_left > 0
+                            ? "Try again in " + std::to_string(secs_left) + "s."
+                            : "Press Enter to try again.")
                             | center | color(Color::RedLight),
                         separatorEmpty(),
                         text("Press Esc to quit.") | dim | center,
@@ -604,7 +699,6 @@ int main() {
             );
         }
 
-        // LOGIN
         if (state == AppState::LOGIN) {
             Elements rows;
             rows.push_back(hbox(text(" Username : "), input_username->Render()));
@@ -612,19 +706,12 @@ int main() {
             rows.push_back(hbox(text(" Password : "), input_password->Render()));
             rows.push_back(separator());
             if (!error_msg.empty()) {
-                bool is_success = (error_msg.find("Setup selesai") != std::string::npos);
+                bool is_success = (error_msg.find("Setup complete") != std::string::npos);
                 rows.push_back(text(" " + error_msg)
                     | color(is_success ? Color::GreenLight : Color::Red) | center);
                 rows.push_back(separatorEmpty());
             }
             rows.push_back(login_button->Render());
-            rows.push_back(separatorEmpty());
-            Color ac = (attempts > MAX_ATTEMPTS / 2)
-                ? Color::GreenLight : (attempts > 1 ? Color::Yellow : Color::Red);
-            rows.push_back(
-                text("Attempts remaining: " + std::to_string(attempts))
-                    | color(ac) | center
-            );
             return center(
                 window(text("Hall Of Fame Login ") | bold | center,
                     vbox(std::move(rows))
@@ -632,14 +719,11 @@ int main() {
             );
         }
 
-        // MAIN MENU
         if (state == AppState::MENU) {
             Elements rows;
             rows.push_back(
-                hbox({
-                    text("Logged in as: ") | dim,
-                    text(trim(username)) | bold | color(Color::GreenLight),
-                }) | center
+                hbox({ text("Logged in as: ") | dim,
+                       text(cfg.username) | bold | color(Color::GreenLight) }) | center
             );
             rows.push_back(separator());
             if (!error_msg.empty()) {
@@ -648,22 +732,17 @@ int main() {
             }
             rows.push_back(
                 hbox({
-                    btn_add_player->Render(),
-                    separatorEmpty(),
-                    btn_view->Render(),
-                    separatorEmpty(),
-                    btn_sort->Render(),
-                    separatorEmpty(),
+                    btn_add_player->Render(), separatorEmpty(),
+                    btn_view->Render(),       separatorEmpty(),
+                    btn_sort->Render(),       separatorEmpty(),
                     btn_credits->Render(),
                 }) | center
             );
             rows.push_back(separator());
             rows.push_back(btn_logout->Render() | center);
-
             return center(
-                window(text(" Main Menu ") | bold | center,
-                    vbox(std::move(rows))
-                ) | size(WIDTH, GREATER_THAN, 50)
+                window(text(" Main Menu ") | bold | center, vbox(std::move(rows)))
+                | size(WIDTH, GREATER_THAN, 50)
             );
         }
 
@@ -678,37 +757,28 @@ int main() {
                 rows.push_back(text(" " + input_error) | color(c) | center);
                 rows.push_back(separatorEmpty());
             }
-            rows.push_back(
-                hbox({
-                    btn_confirm_add->Render(),
-                    btn_back_add->Render(),
-                }) | center
-            );
+            rows.push_back(hbox({ btn_confirm_add->Render(), btn_back_add->Render() }) | center);
             return center(
-                window(text(" Add Player ") | bold | center,
-                    vbox(std::move(rows))
-                ) | clear_under
+                window(text(" Add Player ") | bold | center, vbox(std::move(rows)))
+                | clear_under
             );
         }
 
-        // CREDITS
         if (state == AppState::CREDITS) {
             Elements rows;
-            rows.push_back(text("Kelompok 7 TUBES PSDA") | bold | center | color(Color::Cyan));
+            rows.push_back(text("Group 7 — TUBES PSDA") | bold | center | color(Color::Cyan));
             rows.push_back(separator());
             rows.push_back(hbox(text(" 1. "), text("Abdul Vaiz Vahry Iskandar ") | flex, text("G1A025063 ")));
-            rows.push_back(hbox(text(" 2. "), text("Nadhif Arwendo ") | flex, text("G1A025077 ")));
-            rows.push_back(hbox(text(" 3. "), text("Ivo Indah Ghazeta ") | flex, text("G1A025087 ")));
+            rows.push_back(hbox(text(" 2. "), text("Nadhif Arwendo ") | flex,             text("G1A025077 ")));
+            rows.push_back(hbox(text(" 3. "), text("Ivo Indah Ghazeta ") | flex,          text("G1A025087 ")));
             rows.push_back(separator());
             rows.push_back(btn_back_credits->Render() | center);
             return center(
-                window(text(" Team Credits ") | bold | center,
-                    vbox(std::move(rows))
-                ) | clear_under | size(WIDTH, GREATER_THAN, 40)
+                window(text(" Team Credits ") | bold | center, vbox(std::move(rows)))
+                | clear_under | size(WIDTH, GREATER_THAN, 40)
             );
         }
 
-        // EDIT PLAYER
         if (state == AppState::EDIT_PLAYER) {
             Elements rows;
             if (selected_idx >= 0 && selected_idx < (int)players.size())
@@ -731,65 +801,56 @@ int main() {
                 hbox({ btn_confirm_edit->Render(), btn_back_edit->Render() }) | center
             );
             return center(
-                window(text(" Edit Player ") | bold | center,
-                    vbox(std::move(rows))
-                ) | clear_under
+                window(text(" Edit Player ") | bold | center, vbox(std::move(rows)))
+                | clear_under
             );
         }
 
-        // VIEW LEADERBOARD
+        // VIEW_BOARD
         Elements rows;
 
-        // === CONFIRM DELETE DIALOG ===
         if (confirm_delete && selected_idx >= 0 && selected_idx < (int)players.size()) {
-            rows.push_back(
-                vbox({
-                    text("Hapus player ini?") | bold | center,
+            rows.push_back(vbox({
+                text("Delete this player?") | bold | center,
+                separatorEmpty(),
+                text("  " + players[selected_idx].name +
+                     "  (score: " + std::to_string(players[selected_idx].score) + ")")
+                    | color(Color::Yellow) | center,
+                separatorEmpty(),
+                hbox({
+                    text("[ Yes, Delete ]") | color(Color::Red) | bold | center | border,
                     separatorEmpty(),
-                    text("  " + players[selected_idx].name +
-                         "  (score: " + std::to_string(players[selected_idx].score) + ")")
-                        | color(Color::Yellow) | center,
-                    separatorEmpty(),
-                    hbox({
-                        // Tombol konfirmasi inline via lambda — dibuat saat render
-                        text("[ Ya, Hapus ]") | color(Color::Red) | bold | center | border,
-                        separatorEmpty(),
-                        text("[  Batal  ]") | center | border,
-                    }) | center,
-                    separatorEmpty(),
-                    text("Tekan Y = hapus   N/Esc = batal") | dim | center,
-                })
-            );
+                    text("[  Cancel  ]") | center | border,
+                }) | center,
+                separatorEmpty(),
+                text("Y = confirm   N/Esc = cancel") | dim | center,
+            }));
             rows.push_back(separatorEmpty());
             rows.push_back(btn_back_view->Render() | center);
             return center(
-                window(text(" Konfirmasi Hapus ") | bold | center | color(Color::Red),
+                window(text(" Confirm Delete ") | bold | center | color(Color::Red),
                     vbox(std::move(rows))
                 ) | clear_under
             );
         }
 
-        // === CONFIRM RESET DIALOG ===
         if (confirm_reset) {
-            rows.push_back(
-                vbox({
-                    text("Reset SEMUA data leaderboard?") | bold | center | color(Color::Red),
-                    separatorEmpty(),
-                    text("Tindakan ini tidak dapat dibatalkan!") | dim | center,
-                    separatorEmpty(),
-                    text("Tekan Y = reset semua   N/Esc = batal") | dim | center,
-                })
-            );
+            rows.push_back(vbox({
+                text("Reset ALL leaderboard data?") | bold | center | color(Color::Red),
+                separatorEmpty(),
+                text("This action cannot be undone!") | dim | center,
+                separatorEmpty(),
+                text("Y = reset all   N/Esc = cancel") | dim | center,
+            }));
             rows.push_back(separatorEmpty());
             rows.push_back(btn_back_view->Render() | center);
             return center(
-                window(text(" Konfirmasi Reset ") | bold | center | color(Color::Red),
+                window(text(" Confirm Reset ") | bold | center | color(Color::Red),
                     vbox(std::move(rows))
                 ) | clear_under
             );
         }
 
-        // === TABEL LEADERBOARD ===
         if (players.empty()) {
             rows.push_back(text("No players yet.") | dim | center);
         } else {
@@ -798,9 +859,8 @@ int main() {
                 text(" # ") | bold | center,
                 text(" Player Name ") | bold | center,
                 text(" Score ") | bold | center,
-                text(" Aksi ") | bold | center,
+                text(" Action ") | bold | center,
             });
-
             for (size_t i = 0; i < players.size(); ++i) {
                 Color rc = Color::Default;
                 if (sorted) {
@@ -816,7 +876,6 @@ int main() {
                     text(is_sel ? " [selected] " : " - ") | dim | center,
                 });
             }
-
             auto lb_table = Table(table_data);
             lb_table.SelectAll().Border(LIGHT);
             lb_table.SelectRow(0).Decorate(bold);
@@ -827,69 +886,52 @@ int main() {
         }
 
         rows.push_back(separatorEmpty());
-
-        // Instruksi navigasi
         if (!players.empty()) {
             rows.push_back(
                 hbox({
-                    text(" ↑↓ pilih row") | dim,
+                    text(" ↑↓ select row") | dim,
                     text("  |  ") | dim,
-                    text("E") | bold | color(Color::Cyan),
-                    text(" edit") | dim,
+                    text("E") | bold | color(Color::Cyan),   text(" edit")   | dim,
                     text("  |  ") | dim,
-                    text("D") | bold | color(Color::Red),
-                    text(" hapus") | dim,
+                    text("D") | bold | color(Color::Red),    text(" delete") | dim,
                     text("  |  ") | dim,
-                    text("R") | bold | color(Color::Yellow),
-                    text(" reset semua") | dim,
+                    text("R") | bold | color(Color::Yellow), text(" reset all") | dim,
                 }) | center
             );
             rows.push_back(separatorEmpty());
             if (selected_idx >= 0 && selected_idx < (int)players.size()) {
                 rows.push_back(
-                    text("Dipilih: " + players[selected_idx].name)
+                    text("Selected: " + players[selected_idx].name)
                         | color(Color::Cyan) | center
                 );
                 rows.push_back(separatorEmpty());
             }
         }
-
         rows.push_back(btn_back_view->Render() | center);
 
         return center(
-            window(text(" Leaderboard ") | bold | center,
-                vbox(std::move(rows))
-            ) | clear_under
+            window(text(" Leaderboard ") | bold | center, vbox(std::move(rows)))
+            | clear_under
         );
     });
 
-    // Global events
     renderer |= CatchEvent([&](Event event) {
         tab_index = static_cast<int>(state);
 
         if (event == Event::Escape) {
             if (state == AppState::EDIT_PLAYER) {
-                input_error.clear();
-                confirm_delete = false;
-                state = AppState::VIEW_BOARD;
-                return true;
+                input_error.clear(); confirm_delete = false;
+                state = AppState::VIEW_BOARD; return true;
             }
             if (state == AppState::VIEW_BOARD) {
                 if (confirm_delete || confirm_reset) {
-                    confirm_delete = false;
-                    confirm_reset  = false;
-                    return true;
+                    confirm_delete = false; confirm_reset = false; return true;
                 }
-                input_error.clear();
-                state = AppState::MENU;
-                return true;
+                input_error.clear(); state = AppState::MENU; return true;
             }
             if (state == AppState::ADD_PLAYER || state == AppState::CREDITS) {
-                input_error.clear();
-                state = AppState::MENU;
-                return true;
+                input_error.clear(); state = AppState::MENU; return true;
             }
-            // SETUP & LOGIN & LOCKED → keluar program
             screen.ExitLoopClosure()();
             return true;
         }
@@ -897,87 +939,71 @@ int main() {
         if (event == Event::Return) {
             if (state == AppState::SETUP)  { on_setup();  return true; }
             if (state == AppState::LOGIN)  { on_login();  return true; }
-            if (state == AppState::LOCKED) { screen.ExitLoopClosure()(); return true; }
+            if (state == AppState::LOCKED) {
+                auto now_epoch = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+                if (now_epoch >= cfg.lockout_until) {
+                    cfg.failed_attempts = 0; cfg.lockout_until = 0;
+                    attempts = MAX_ATTEMPTS;
+                    save_config(cfg);
+                    state = AppState::LOGIN;
+                }
+                return true;
+            }
             return false;
         }
 
-        // ── Navigasi & aksi di layar Leaderboard ──
         if (state == AppState::VIEW_BOARD && !players.empty()) {
-
-            // Konfirmasi delete: Y = ya, N = batal
             if (confirm_delete) {
                 if (event == Event::Character('y') || event == Event::Character('Y')) {
                     if (selected_idx >= 0 && selected_idx < (int)players.size()) {
                         players.erase(players.begin() + selected_idx);
                         if (selected_idx >= (int)players.size())
                             selected_idx = (int)players.size() - 1;
-                        save_players(players);
+                        save_players(players, cfg.salt);
                     }
-                    confirm_delete = false;
-                    return true;
+                    confirm_delete = false; return true;
                 }
                 if (event == Event::Character('n') || event == Event::Character('N')) {
-                    confirm_delete = false;
-                    return true;
+                    confirm_delete = false; return true;
                 }
                 return false;
             }
-
-            // Konfirmasi reset: Y = ya, N = batal
             if (confirm_reset) {
                 if (event == Event::Character('y') || event == Event::Character('Y')) {
-                    players.clear();
-                    selected_idx = -1;
-                    sorted = false;
-                    save_players(players);
-                    confirm_reset = false;
-                    return true;
+                    players.clear(); selected_idx = -1; sorted = false;
+                    save_players(players, cfg.salt);
+                    confirm_reset = false; return true;
                 }
                 if (event == Event::Character('n') || event == Event::Character('N')) {
-                    confirm_reset = false;
-                    return true;
+                    confirm_reset = false; return true;
                 }
                 return false;
             }
-
-            // Navigasi baris ↑↓
             if (event == Event::ArrowUp) {
-                if (selected_idx > 0) --selected_idx;
-                else selected_idx = 0;
-                return true;
+                if (selected_idx > 0) --selected_idx; else selected_idx = 0; return true;
             }
             if (event == Event::ArrowDown) {
                 if (selected_idx < (int)players.size() - 1) ++selected_idx;
-                else selected_idx = (int)players.size() - 1;
-                return true;
+                else selected_idx = (int)players.size() - 1; return true;
             }
-
-            // E = Edit player yang dipilih
             if (event == Event::Character('e') || event == Event::Character('E')) {
                 if (selected_idx >= 0 && selected_idx < (int)players.size()) {
                     edit_name      = players[selected_idx].name;
                     edit_score_str = std::to_string(players[selected_idx].score);
-                    input_error.clear();
-                    state = AppState::EDIT_PLAYER;
+                    input_error.clear(); state = AppState::EDIT_PLAYER;
                 }
                 return true;
             }
-
-            // D = Hapus player yang dipilih (minta konfirmasi)
             if (event == Event::Character('d') || event == Event::Character('D')) {
-                if (selected_idx >= 0 && selected_idx < (int)players.size()) {
+                if (selected_idx >= 0 && selected_idx < (int)players.size())
                     confirm_delete = true;
-                }
                 return true;
             }
-
-            // R = Reset semua (minta konfirmasi)
             if (event == Event::Character('r') || event == Event::Character('R')) {
-                confirm_reset = true;
-                return true;
+                confirm_reset = true; return true;
             }
         }
-
         return false;
     });
 
