@@ -47,10 +47,6 @@ Setelah proses build selesai, jalankan file executable yang dihasilkan:
 ./HallOfFame
 ```
 
-## 🔐 Informasi Login Default
-- **Username**: `admin`
-- **Password**: `admin123`
-
 ## ⌨️ Kontrol Navigasi
 - **Panah (Arrow Keys) / Tab**: Berpindah antar tombol atau input field.
 - **Enter**: Memilih tombol atau melakukan aksi.
